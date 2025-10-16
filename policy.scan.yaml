@@ -1,0 +1,9 @@
+scope:
+  exclude:
+    - "^bin/"
+rules:
+  input_validation_parsing: { enabled: true }
+  concurrency: { enabled: true }
+  general_security: { enabled: true }
+output:
+  confidence_threshold: 0.5

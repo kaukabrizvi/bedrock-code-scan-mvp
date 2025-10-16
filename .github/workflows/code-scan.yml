@@ -1,0 +1,41 @@
+name: code-scan
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps for diff script (optional)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml || true
+
+      - name: Collect diff
+        run: |
+          python scripts/collect_diff.py > scan_payload.json
+          cat scan_payload.json | jq 'keys' || true
+
+      - name: Call scanner Lambda URL
+        env:
+          SCAN_FN_URL: ${{ secrets.SCAN_FN_URL }}
+        run: |
+          test -n "$SCAN_FN_URL" || { echo "Missing secret SCAN_FN_URL"; exit 1; }
+          curl -sS -X POST "$SCAN_FN_URL" \
+            -H "Content-Type: application/json" \
+            -d @scan_payload.json | tee scan_result.json
+
+      - name: Print summary
+        run: |
+          echo "---- Findings ----"
+          cat scan_result.json | jq '.summary, (.findings[]? | {file, title, severity, category, confidence})' || cat scan_result.json

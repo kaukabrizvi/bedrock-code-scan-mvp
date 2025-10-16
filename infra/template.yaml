@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Bedrock MVP Code Scanner
+
+Parameters:
+  ModelId:
+    Type: String
+    Description: Bedrock model ID (e.g., anthropic.claude-3-5-sonnet-20240620-v1:0)
+  AllowedGitHubRepo:
+    Type: String
+    Description: "owner/repo that can call the function (MVP not enforced)"
+
+Resources:
+  CodeScanFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../scanner
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          MODEL_ID: !Ref ModelId
+          REGION: !Ref AWS::Region
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - "bedrock:InvokeModel"
+                - "bedrock:InvokeModelWithResponseStream"
+              Resource: "*"
+
+  CodeScanFnUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt CodeScanFn.Arn
+      AuthType: NONE
+      Cors:
+        AllowMethods: ['POST']
+        AllowOrigins: ['*']
+        AllowHeaders: ['*']
+
+Outputs:
+  FunctionUrl:
+    Value: !GetAtt CodeScanFnUrl.FunctionUrl
+    Description: Public function URL
