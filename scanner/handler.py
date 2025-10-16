@@ -130,3 +130,4 @@ def lambda_handler(event, context):
             "findings": findings_total[:50]
         }),
     }
+// trigger
