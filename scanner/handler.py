@@ -166,4 +166,3 @@ def lambda_handler(event, context):
             "errors": errors[:20]
         }),
     }
-# trigger
