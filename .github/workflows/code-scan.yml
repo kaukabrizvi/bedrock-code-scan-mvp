@@ -6,10 +6,18 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    concurrency:
+      group: code-scan
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # IMPORTANT: get full history so base/head exist
+
+      - name: Fetch PR base explicitly (defensive)
+        if: ${{ github.event.pull_request.base.ref != '' }}
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }} || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -19,23 +27,43 @@ jobs:
       - name: Install deps for diff script (optional)
         run: |
           python -m pip install --upgrade pip
-          pip install pyyaml || true
+          pip install pyyaml jq-cli-wrapper || true
 
       - name: Collect diff
+        env:
+          GITHUB_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python scripts/collect_diff.py > scan_payload.json
-          cat scan_payload.json | jq 'keys' || true
+          echo "Payload keys:" && jq 'keys' scan_payload.json
+          echo "Files count:" && jq '.files | length' scan_payload.json
+      - name: Inspect payload
+        run: |
+          echo "files:" && jq '.files | length' scan_payload.json
+          echo "top files:" && jq -r '.files[0:10][].path' scan_payload.json
+          echo "payload bytes:" && wc -c < scan_payload.json
 
-      - name: Call scanner Lambda URL
+      - name: Call scanner Lambda URL (retry)
         env:
           SCAN_FN_URL: ${{ secrets.SCAN_FN_URL }}
+          SCAN_SHARED_TOKEN: ${{ secrets.SCAN_SHARED_TOKEN }}
         run: |
-          test -n "$SCAN_FN_URL" || { echo "Missing secret SCAN_FN_URL"; exit 1; }
-          curl -sS -X POST "$SCAN_FN_URL" \
-            -H "Content-Type: application/json" \
-            -d @scan_payload.json | tee scan_result.json
-
-      - name: Print summary
-        run: |
-          echo "---- Findings ----"
-          cat scan_result.json | jq '.summary, (.findings[]? | {file, title, severity, category, confidence})' || cat scan_result.json
+          test -n "$SCAN_FN_URL" || { echo "Missing SCAN_FN_URL"; exit 1; }
+          for i in 1 2 3; do
+            echo "Attempt $i..."
+            if curl -sS -X POST "$SCAN_FN_URL" \
+                 -H "Content-Type: application/json" \
+                 ${SCAN_SHARED_TOKEN:+ -H "X-Scan-Token: $SCAN_SHARED_TOKEN"} \
+                 --data-binary @scan_payload.json > scan_result.json; then
+              break
+            fi
+            sleep $((i*i))
+          done
+          if jq -e . >/dev/null 2>&1 < scan_result.json; then
+            echo "---- Findings ----"
+            jq '.summary, (.findings[]? | {file, title, severity, category, confidence}), {errors: .errors}' scan_result.json
+          else
+            echo "(non-JSON response from scanner; printing raw)"
+            cat scan_result.json
+          fi
