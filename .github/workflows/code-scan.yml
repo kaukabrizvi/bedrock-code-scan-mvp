@@ -38,6 +38,11 @@ jobs:
           python scripts/collect_diff.py > scan_payload.json
           echo "Payload keys:" && jq 'keys' scan_payload.json
           echo "Files count:" && jq '.files | length' scan_payload.json
+      - name: Inspect payload
+        run: |
+          echo "files:" && jq '.files | length' scan_payload.json
+          echo "top files:" && jq -r '.files[0:10][].path' scan_payload.json
+          echo "payload bytes:" && wc -c < scan_payload.json
 
       - name: Call scanner Lambda URL (retry)
         env:
