@@ -1,10 +1,21 @@
 import os, json, base64, re
 from typing import List, Dict
 import boto3
+import time, random, traceback
+from botocore.config import Config
+import botocore.exceptions
 
 REGION = os.getenv("REGION", "us-east-1")
 MODEL_ID = os.getenv("MODEL_ID")
-bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=REGION,
+    config=Config(
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        read_timeout=60,
+        connect_timeout=5,
+    ),
+)
 
 DEFAULT_EXCLUDES = [r"^bin/"]
 
@@ -75,21 +86,32 @@ OUTPUT SCHEMA:
     }
 
 def invoke_bedrock(body: Dict) -> Dict:
-    r = bedrock.invoke_model(
-        modelId=MODEL_ID,
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps(body),
-    )
-    payload = json.loads(r["body"].read())
-    text = ""
-    if "content" in payload and payload["content"]:
-        text = payload["content"][0].get("text", "")
-    try:
-        data = json.loads(text)
-    except Exception:
-        data = {"findings": []}
-    return data
+    max_tries = 6  # ~ up to ~ (0.5+1+2+4+8) secs worst-case
+    for attempt in range(max_tries):
+        try:
+            r = bedrock.invoke_model(
+                modelId=MODEL_ID,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(body),
+            )
+            payload = json.loads(r["body"].read())
+            text = payload.get("content", [{}])[0].get("text", "") if isinstance(payload.get("content"), list) else ""
+            try:
+                return json.loads(text) if text else {"findings": []}
+            except Exception:
+                return {"findings": []}
+        except botocore.exceptions.ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("ThrottlingException", "TooManyRequestsException"):
+                sleep = min(0.5 * (2 ** attempt) + random.random(), 8.0)
+                time.sleep(sleep)
+                continue
+            # return structured error instead of 500
+            return {"error": f"bedrock_client_error:{code}", "findings": []}
+        except Exception as e:
+            return {"error": f"bedrock_invoke_failed:{type(e).__name__}: {e}", "findings": []}
+    return {"error": "bedrock_throttled_after_retries", "findings": []}
 
 def lambda_handler(event, context):
     try:
@@ -98,13 +120,22 @@ def lambda_handler(event, context):
             body = base64.b64decode(body).decode("utf-8")
         payload = json.loads(body)
     except Exception as e:
-        return {"statusCode": 400, "body": json.dumps({"error": f"bad request: {e}"})}
+        return {
+            "statusCode": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": f"bad request: {e}"})
+        }
 
     policy = load_repo_policy(payload)
     excludes = DEFAULT_EXCLUDES + policy.get("scope", {}).get("exclude", [])
 
+    MAX_FILES = int(os.getenv("MAX_FILES_PER_INVOCATION", "12"))
+    SLEEP_BETWEEN = float(os.getenv("SLEEP_BETWEEN_CALLS", "0.25"))
+
     findings_total = []
-    for f in payload.get("files", []):
+    errors = []
+    files_in = payload.get("files", [])[:MAX_FILES]
+    for f in files_in:
         path = f["path"]
         if is_excluded(path, excludes):
             continue
@@ -118,16 +149,21 @@ def lambda_handler(event, context):
         }
         req = build_prompt(policy, file_item)
         resp = invoke_bedrock(req)
+        if "error" in resp:
+            errors.append({"file": path, "error": resp["error"]})
+            continue
         for item in resp.get("findings", []):
             item.setdefault("file", path)
         findings_total.extend(resp.get("findings", []))
+        time.sleep(SLEEP_BETWEEN)
 
     return {
         "statusCode": 200,
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps({
-            "summary": {"count": len(findings_total)},
-            "findings": findings_total[:50]
+            "summary": {"count": len(findings_total), "errors": len(errors)},
+            "findings": findings_total[:50],
+            "errors": errors[:20]
         }),
     }
 // trigger

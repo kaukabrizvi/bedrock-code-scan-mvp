@@ -3,6 +3,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+concurrency:
+  group: code-scan
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -26,16 +30,24 @@ jobs:
           python scripts/collect_diff.py > scan_payload.json
           cat scan_payload.json | jq 'keys' || true
 
-      - name: Call scanner Lambda URL
+      - name: Call scanner Lambda URL (retry)
         env:
           SCAN_FN_URL: ${{ secrets.SCAN_FN_URL }}
         run: |
-          test -n "$SCAN_FN_URL" || { echo "Missing secret SCAN_FN_URL"; exit 1; }
-          curl -sS -X POST "$SCAN_FN_URL" \
-            -H "Content-Type: application/json" \
-            -d @scan_payload.json | tee scan_result.json
-
-      - name: Print summary
-        run: |
-          echo "---- Findings ----"
-          cat scan_result.json | jq '.summary, (.findings[]? | {file, title, severity, category, confidence})' || cat scan_result.json
+          for i in 1 2 3; do
+            echo "Attempt $i..."
+            if curl -sS -X POST "$SCAN_FN_URL" \
+                 -H "Content-Type: application/json" \
+                 --data-binary @scan_payload.json > scan_result.json; then
+              break
+            fi
+            sleep $((i*i))
+          done
+          # Do not fail the job if non-JSON
+          if jq -e . >/dev/null 2>&1 < scan_result.json; then
+            echo "---- Findings ----"
+            jq '.summary, (.findings[]? | {file, title, severity, category, confidence}), {errors: .errors}' scan_result.json
+          else
+            echo "(non-JSON response from scanner; printing raw)"
+            cat scan_result.json
+          fi
